@@ -2,75 +2,18 @@ import asyncio
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from bs4 import BeautifulSoup, Tag
-from Repositry.redis.redis_config import add_to_set, delete_set, is_member
-from Repositry.db.db_config import execute_query 
-from Repositry.celery.celery_config import app
+from Main.Repositry.redis.redis_config import add_to_set, is_member
+from Main.Repositry.db.db_config import execute_query 
+from Main.Repositry.celery.celery_config import app
+
 
 class ManageHeadlessBrowser:
-    _browser = None  
-    _playwright = None  
 
     @staticmethod
-    async def get_browser():
-        if ManageHeadlessBrowser._browser is None:
-            ManageHeadlessBrowser._playwright = await async_playwright().start()
-            ManageHeadlessBrowser._browser = await ManageHeadlessBrowser._playwright.chromium.launch(headless=True)
-            print("Headless browser started.")
-        return ManageHeadlessBrowser._browser
-
-    @staticmethod
-    async def close_browser():
-        if ManageHeadlessBrowser._browser:
-            await ManageHeadlessBrowser._browser.close()
-            await ManageHeadlessBrowser._playwright.stop()
-            ManageHeadlessBrowser._browser = None
-            ManageHeadlessBrowser._playwright = None
-            print("Headless browser closed.")
-
-
-class ManageExtractedLink:
-
-    PRODUCT_URL_PATTERNS = [
-        '/product/', '/item/', '/p/', '/products/', '/shop/', '/buy/', '/detail/'
-    ]
-
-    @staticmethod
-    def process(job_payload):
-        print(job_payload)
-
-        if is_member(job_payload['website_redis_set'], job_payload['url']):
-            print(f"[SKIP] URL already processed: {job_payload['url']}")
-            return
-
-        add_to_set(job_payload['website_redis_set'], job_payload['url'])
-
-        if(job_payload['depth_score'] < 5):
-            payload = {
-                'url': job_payload['url'],
-                'website_redis_set': job_payload['website_redis_set'],
-                'website_url_id': job_payload['website_url_id'],
-                'depth_score': job_payload['depth_score'] + 1
-            }
-            process_job.delay(payload)
-
-
-        ManageExtractedLink.__add_to_db(job_payload['url'], job_payload['website_url_id'])
-
-    @staticmethod
-    def __add_to_db(url: str, website_url_id: int):
-        if ManageExtractedLink.__is_product_url(url):
-            print(f"[DB] Storing product URL: {url}")
-            execute_query(
-                "INSERT INTO scraped_product_url (website_url_id, product_url) VALUES (%s, %s)",
-                (website_url_id, url)
-            )
-        else:
-            print(f"[SKIP] URL does not match product pattern: {url}")
-
-    @staticmethod
-    def __is_product_url(url: str) -> bool:
-        lower_url = url.lower()
-        return any(pattern in lower_url for pattern in ManageExtractedLink.PRODUCT_URL_PATTERNS)
+    async def launch_browser():
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)
+        return playwright, browser
 
 
 class LinkMethods:
@@ -102,7 +45,7 @@ class ExtractLink:
     async def extract_links_from_page(self, page, url: str) -> list:
         try:
             print(f"Visiting: {url}")
-            await page.goto(url, wait_until="networkidle", timeout=15000)
+            await page.goto(url, wait_until="networkidle", timeout=45000)
         except PlaywrightTimeoutError:
             print(f"[WARN] Timeout while trying to load: {url}")
             return []
@@ -128,16 +71,68 @@ class ExtractLink:
         return links
 
     async def scrape_with_pool(self):
-        browser = await ManageHeadlessBrowser.get_browser()
+        playwright, browser = await ManageHeadlessBrowser.launch_browser()
+        context = await browser.new_context()
+        semaphore = asyncio.Semaphore(self.concurrent_limit)
 
-        results = []
-        for url in self.url_list:
-            page = await browser.new_page()
-            result = await self.extract_links_from_page(page, url)
-            await page.close()
-            results.append(result)
+        async def process_url(url):
+            async with semaphore:
+                page = await context.new_page()
+                result = await self.extract_links_from_page(page, url)
+                await page.close()
+                return result
+
+        tasks = [process_url(url) for url in self.url_list]
+        results = await asyncio.gather(*tasks)
+
+        await context.close()
+        await browser.close()
+        await playwright.stop()
 
         return results
+
+class ManageExtractedLink:
+
+    PRODUCT_URL_PATTERNS = [
+        '/product/', '/item/', '/p/', '/products/', '/shop/', '/buy/', '/detail/'
+    ]
+
+    @staticmethod
+    def process(job_payload):
+        print(job_payload)
+
+        if is_member(job_payload['website_redis_set'], job_payload['url']):
+            print(f"[SKIP] URL already processed: {job_payload['url']}")
+            return
+
+        add_to_set(job_payload['website_redis_set'], job_payload['url'])
+
+        if job_payload['depth_score'] < 5:
+            payload = {
+                'url': job_payload['url'],
+                'website_redis_set': job_payload['website_redis_set'],
+                'website_url_id': job_payload['website_url_id'],
+                'depth_score': job_payload['depth_score'] + 1
+            }
+            process_job.delay(payload)
+
+        ManageExtractedLink.__add_to_db(job_payload['url'], job_payload['website_url_id'])
+
+    @staticmethod
+    def __add_to_db(url: str, website_url_id: int):
+        if ManageExtractedLink.__is_product_url(url):
+            print(f"[DB] Storing product URL: {url}")
+            execute_query(
+                "INSERT INTO scraped_product_url (website_url_id, product_url) VALUES (%s, %s)",
+                (website_url_id, url)
+            )
+        else:
+            print(f"[SKIP] URL does not match product pattern: {url}")
+
+    @staticmethod
+    def __is_product_url(url: str) -> bool:
+        lower_url = url.lower()
+        return any(pattern in lower_url for pattern in ManageExtractedLink.PRODUCT_URL_PATTERNS)
 
 
 @app.task(name="scraper.process_job")

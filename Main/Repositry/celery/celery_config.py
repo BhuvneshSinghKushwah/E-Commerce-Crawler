@@ -10,4 +10,4 @@ app = Celery('my_crawler',
 
 app.conf.broker_transport_options = {'max_connections': 20}
 
-import Src.scraper as scraper
+import Main.scraper as scraper
